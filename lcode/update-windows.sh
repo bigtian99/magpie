@@ -23,9 +23,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 脚本在 <repo>/lcode/ 下，源码仓库是上一级
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PATCH="$SCRIPT_DIR/patches/0001-add-lcode-agent.patch"
-BUILD_DIR="${TMPDIR:-/tmp}/magpie-lcode-build"
-WT="$BUILD_DIR/worktree"
+BUILD_BASE="${TMPDIR:-/tmp}"
+BUILD_DIR=""
+WT=""
 GO_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/magpie-lcode"
+
+# 每次一个新的构建目录。用固定的 $BUILD_BASE/magpie-lcode-build 时，前一次
+# 跑完残留的空 worktree 目录（被 Windows 上的资源管理器或索引器占着句柄，
+# rm -rf 报 Device or resource busy）会让下一次跑直接死在 “准备构建目录”。
+# 带随机后缀就永远碰不上旧的锁，旧目录由各自的清理代码自己清。
+make_build_dir() {
+  BUILD_DIR="$BUILD_BASE/magpie-lcode-build.$$"
+  WT="$BUILD_DIR/worktree"
+  mkdir -p "$BUILD_DIR"
+}
 
 CHECK_ONLY=0
 FORCE=0
@@ -84,9 +95,14 @@ installed_version() {
 # ---- 1. 查官方最新版本 ----
 if [ -z "$TAG" ]; then
   echo "==> 查询官方最新 release"
-  TAG="$(curl -fsSL --max-time 25 \
-        https://api.github.com/repos/yetone/magpie-releases/releases/latest \
-        | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  # 偶发的 TLS 抖动（schannel 关连接）让第一次查询空手，停一下重试
+  for _ in 1 2 3; do
+    TAG="$(curl -fsSL --max-time 25 \
+          https://api.github.com/repos/yetone/magpie-releases/releases/latest 2>/dev/null \
+          | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    [ -n "$TAG" ] && break
+    sleep 2
+  done
 fi
 [ -n "$TAG" ] || { echo "查不到官方版本，请用 --tag 指定" >&2; exit 1; }
 
@@ -118,9 +134,7 @@ BASE="$(git rev-parse --short "$TAG")"
 
 # ---- 3. 在独立 worktree 里打补丁，不碰本地分支 ----
 echo "==> 准备构建目录"
-mkdir -p "$BUILD_DIR"
-git -C "$REPO_DIR" worktree remove --force "$WT" 2>/dev/null || true
-rm -rf "$WT"
+make_build_dir
 git -C "$REPO_DIR" worktree add -q --detach "$WT" "$TAG"
 cd "$WT"
 
@@ -299,9 +313,15 @@ if [ "$DO_LAUNCH" = 1 ]; then
 fi
 
 # ---- 10. 收尾 ----
-git -C "$REPO_DIR" worktree remove --force "$WT" 2>/dev/null || true
+# worktree 本体被 Windows 上的谁（资源管理器、索引器、杀软）占着时，
+# worktree remove 删得掉 .git 却删不掉目录，下一次 rm -rf 撞它。
+# 真正的记录清掉，目录清不掉就留着：下一次用新后缀，不会再碰它。
+if ! git -C "$REPO_DIR" worktree remove --force "$WT" 2>/dev/null; then
+  git -C "$REPO_DIR" worktree prune 2>/dev/null || true
+fi
 # 桌面上的那份是给人用的，构建目录里不留副本
-rm -f "$TMP_EXE"
+rm -f "$TMP_EXE" 2>/dev/null || true
+rm -rf "$BUILD_DIR" 2>/dev/null || true
 if [ "$DO_LAUNCH" = 0 ]; then
   echo ""
   echo "产物已在桌面: $EXE"
