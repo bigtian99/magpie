@@ -314,14 +314,23 @@ fi
 
 # ---- 10. 收尾 ----
 # worktree 本体被 Windows 上的谁（资源管理器、索引器、杀软）占着时，
-# worktree remove 删得掉 .git 却删不掉目录，下一次 rm -rf 撞它。
-# 真正的记录清掉，目录清不掉就留着：下一次用新后缀，不会再碰它。
+# worktree remove 删得掉 .git 却删不掉目录。句柄通常几秒后自己松开，
+# 所以先重试，实在不行把记录 prune 掉、目录留着：下一次用新后缀，不会撞。
 if ! git -C "$REPO_DIR" worktree remove --force "$WT" 2>/dev/null; then
   git -C "$REPO_DIR" worktree prune 2>/dev/null || true
 fi
 # 桌面上的那份是给人用的，构建目录里不留副本
 rm -f "$TMP_EXE" 2>/dev/null || true
-rm -rf "$BUILD_DIR" 2>/dev/null || true
+for i in 1 2 3; do
+  rm -rf "$BUILD_DIR" 2>/dev/null && break
+  sleep 2
+done
+# 之前几次跑剩下的（目录空着、句柄已松）一并带走；清不掉的留到下次
+for old in "$BUILD_BASE"/magpie-lcode-build "$BUILD_BASE"/magpie-lcode-build.*; do
+  [ -d "$old" ] || continue
+  [ "$old" = "$BUILD_DIR" ] && continue
+  rm -rf "$old" 2>/dev/null || true
+done
 if [ "$DO_LAUNCH" = 0 ]; then
   echo ""
   echo "产物已在桌面: $EXE"
