@@ -1,0 +1,929 @@
+diff --git a/internal/agent/agents.go b/internal/agent/agents.go
+index c16febf..f9f6eb3 100644
+--- a/internal/agent/agents.go
++++ b/internal/agent/agents.go
+@@ -145,6 +145,7 @@ func builtins(home, cfg string) []*Agent {
+ 		grok(home),
+ 		grokApp(home),
+ 		zcode(home),
++		lcode(home),
+ 		workbuddy(home),
+ 		workbuddyAI(home),
+ 		codebuddy(home),
+diff --git a/internal/agent/lcode.go b/internal/agent/lcode.go
+new file mode 100644
+index 0000000..c2475ab
+--- /dev/null
++++ b/internal/agent/lcode.go
+@@ -0,0 +1,626 @@
++package agent
++
++import (
++	"encoding/json"
++	"errors"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"runtime"
++	"slices"
++	"strings"
++
++	"github.com/yetone/magpie/internal/appdir"
++	"github.com/yetone/magpie/internal/edit"
++	"github.com/yetone/magpie/internal/gateway"
++)
++
++// LCode (Zhipu's desktop app) keeps its model providers in
++// ~/.lcode/v2/config.json (under the folder the user moved its data to, when
++// they did: appdir.LCodeDataIn), OpenCode's provider shape with a kind of its own:
++//
++//	{"provider":{"magpie":{"name":"magpie","kind":"anthropic",
++//	  "options":{"apiKey":"magpie","baseURL":"http://127.0.0.1:3425"},
++//	  "enabled":true,"source":"custom",
++//	  "models":{"<id>":{"name":…,"limit":{"context":…,"output":…},"modalities":{…},
++//	    "reasoning":{"enabled":true,"variants":[…],"defaultVariant":…}}}}}}
++//
++// An anthropic provider is asked at baseURL + /v1/messages. The model is
++// picked per task in LCode's own picker and kept in its window, not in a
++// file, so what magpie sets is whether its models are in that picker.
++//
++// LCode 3.14 moved its providers to ~/.lcode/v2/provider_config.json and
++// reads config.json's only once, to import them, so a provider added there
++// later never reached its picker. There a provider is a rule, and a model's
++// context window and inputs are rules of their own:
++//
++//	{"schemaVersion":1,"config":{
++//	  "providerConfigRules":{"providerRules":[{"providerId":"magpie",
++//	    "providerName":"magpie","enabled":true,"config":{
++//	      "group":"standard-personal",
++//	      "access":{"type":"api-key","apiKey":"magpie"},
++//	      "api":{"type":"anthropic-messages","baseUrl":"http://127.0.0.1:3425"},
++//	      "personalModelIds":[…],"modelOrder":[…]}}]},
++//	  "modelConfigRules":{"providerModelRules":[{"providerId":"magpie",
++//	    "modelId":…,"config":{"properties":{"contextWindow":…,
++//	      "inputFormat":{"supportsImage":…},"supportsNativeWebSearch":true},
++//	      "optionSpecs":{"maxOutputTokens":{"max":…},"reasoningLevel":{"values":[…]}}}}],
++//	    "manualProviderModelRules":[…]}}}
++//
++// magpie writes both files, so an older LCode sees its models too. A model
++// the user set by hand in LCode (a manual rule) keeps what they set.
++//
++// magpie's gateway answers all three of LCode's API formats at the same
++// address (/v1/messages, /chat/completions, /responses), so the format the
++// user picked in LCode's provider settings is theirs: a sync keeps it in both
++// files (lcodeFormat), and only a provider magpie adds new starts on
++// Anthropic Messages.
++
++// lcodeOS is the OS LCode's home is found for, so a test can ask for
++// Windows' (appdir.LCodeHomeOn).
++var lcodeOS = runtime.GOOS
++
++func lcode(home string) *Agent {
++	// where LCode keeps its data: ~/.lcode under the home LCode reads (HOME
++	// first, on Windows too). LCode has no "data storage path" setting of
++	// its own, so the folder is always the home's.
++	dir := filepath.Join(appdir.LCodeHomeOn(lcodeOS, home), ".lcode")
++	path := filepath.Join(dir, "v2", "config.json")
++	rules := filepath.Join(dir, "v2", "provider_config.json")
++	key := "provider." + magpieID
++	wired := func() bool {
++		_, ok := edit.GetJSON(path, key)
++		return ok || lcodeRuled(rules)
++	}
++	return &Agent{
++		ID: "lcode", Name: "LCode", Icon: "lcode", Aliases: []string{"l-code"},
++		UA:  []string{"lcode"},
++		Dir: dir, Path: path,
++		// its picker lists the models picked for it, in both files (#1508)
++		ListsModels: true,
++		Notice: func() string {
++			if Running(`LCode\.app/`, `(^|/)LCode( |$)`) {
++				return noticeLcode.String()
++			}
++			return ""
++		},
++		Sync: func() error {
++			if !wired() {
++				return nil
++			}
++			// a LCode that keeps its providers as rules, with magpie's taken
++			// out there, had it removed in LCode: it isn't put back
++			if _, err := os.Stat(rules); err != nil || lcodeRuled(rules) {
++				if err := lcodeRules(rules, true, true); err != nil {
++					return err
++				}
++			}
++			return edit.SetJSON(path, edit.KV{Path: key, Value: lcodeProviderJSON(path, true)})
++		},
++		Fields: []Field{{
++			Key: "provider", Label: "provider",
++			Get: func() string {
++				if wired() {
++					return magpieID
++				}
++				return ""
++			},
++			Set: func(v string) error {
++				if err := lcodeRules(rules, v != "", false); err != nil {
++					return err
++				}
++				if v == "" {
++					if _, ok := stashLoad()[lcodeSearchedKey]; ok {
++						forget(lcodeSearchedKey)
++					}
++					return edit.DelJSON(path, key)
++				}
++				return edit.SetJSON(path, edit.KV{Path: key, Value: lcodeProviderJSON(path, false)})
++			},
++			Options: func(map[string]string) []Option {
++				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie", Note: "every magpie model in LCode's picker"}}
++			},
++		}},
++	}
++}
++
++// lcodeProviderJSON is magpie's provider in config.json at path; one
++// turned off in LCode stays off. A sync (keep) leaves an address on another
++// machine as it found it (lcodeAddress).
++func lcodeProviderJSON(path string, keep bool) any {
++	was := lcodeVariants(path)
++	ms := map[string]any{}
++	for _, m := range magpieModels("lcode") {
++		window := m.Context
++		if window == 0 {
++			window = 200000
++		}
++		in := []string{"text"}
++		if m.Images {
++			in = append(in, "image")
++		}
++		limit := map[string]any{"context": window}
++		// without it LCode caps every reply at 32000 tokens
++		if out := outputOr(m, lcodeOutput(maxTokens(m))); out > 0 {
++			limit["output"] = out
++		}
++		e := map[string]any{"name": m.Name, "limit": limit,
++			"modalities": map[string]any{"input": in, "output": []string{"text"}}}
++		if levels := lcodeLevels(m.Efforts); levels != nil {
++			e["reasoning"] = map[string]any{"enabled": true, "variants": levels, "defaultVariant": keptEffort(was[m.ID], levels, lcodeDefaultLevel(levels))}
++		}
++		ms[m.ID] = e
++	}
++	on := true
++	if v, ok := edit.GetJSON(path, "provider."+magpieID+".enabled"); ok && v == "false" {
++		on = false
++	}
++	base, token := gateway.URL(), hereKey()
++	if keep {
++		base, token = lcodeKept(filepath.Dir(path))
++	}
++	return map[string]any{"name": "magpie", "kind": lcodeKinds[lcodeFormat(filepath.Dir(path))], "enabled": on, "source": "custom",
++		"options": map[string]any{"apiKey": token, "baseURL": base}, "models": ms}
++}
++
++// lcodeVariants is the default variant each of magpie's models has in
++// config.json at path, which one set by hand keeps (keptEffort).
++func lcodeVariants(path string) map[string]string {
++	var c struct {
++		Provider map[string]struct {
++			Models map[string]struct {
++				Reasoning struct {
++					DefaultVariant string `json:"defaultVariant"`
++				} `json:"reasoning"`
++			} `json:"models"`
++		} `json:"provider"`
++	}
++	b, _ := edit.Read(path)
++	if json.Unmarshal(b, &c) != nil {
++		return nil
++	}
++	out := map[string]string{}
++	for id, m := range c.Provider[magpieID].Models {
++		out[id] = m.Reasoning.DefaultVariant
++	}
++	return out
++}
++
++// lcodeAddress is the address and key magpie's provider is synced with:
++// the gateway's, unless the user pointed the provider at a magpie on another
++// machine (a NAS's), which a sync, there to bring the models up to date,
++// keeps with its key. An address on this machine's loopback is magpie's own
++// and follows the gateway.
++func lcodeAddress(was, wasKey string) (string, string) {
++	if !onAnotherMachine(was) || sameGateway(was, gateway.URL()) {
++		return gateway.URL(), hereKey()
++	}
++	if wasKey == "" {
++		wasKey = gateway.Token
++	}
++	return was, wasKey
++}
++
++// lcodeKept is the address a sync gives magpie's provider in both of
++// LCode's files in dir: one on another machine found in either file, so an
++// edit LCode made to one of them is carried to the other (LCode's own
++// settings write provider_config.json, and a config.json left on this
++// machine's magpie took the provider back there), else the gateway's.
++func lcodeKept(dir string) (string, string) {
++	var r struct {
++		Config struct {
++			ProviderConfigRules struct {
++				ProviderRules []struct {
++					ProviderID string `json:"providerId"`
++					Config     struct {
++						Access struct {
++							APIKey string `json:"apiKey"`
++						} `json:"access"`
++						API struct {
++							BaseURL string `json:"baseUrl"`
++						} `json:"api"`
++					} `json:"config"`
++				} `json:"providerRules"`
++			} `json:"providerConfigRules"`
++		} `json:"config"`
++	}
++	b, _ := os.ReadFile(filepath.Join(dir, "provider_config.json"))
++	json.Unmarshal(b, &r)
++	for _, p := range r.Config.ProviderConfigRules.ProviderRules {
++		if p.ProviderID == magpieID && onAnotherMachine(p.Config.API.BaseURL) {
++			return lcodeAddress(p.Config.API.BaseURL, p.Config.Access.APIKey)
++		}
++	}
++	path := filepath.Join(dir, "config.json")
++	was, _ := edit.GetJSON(path, "provider."+magpieID+".options.baseURL")
++	wasKey, _ := edit.GetJSON(path, "provider."+magpieID+".options.apiKey")
++	return lcodeAddress(was, wasKey)
++}
++
++// lcodeKinds are LCode's API formats in provider_config.json (api.type) and
++// the kind each is in config.json, as LCode maps one to the other.
++var lcodeKinds = map[string]string{
++	"anthropic-messages":      "anthropic",
++	"openai-chat-completions": "openai-compatible",
++	"openai-responses":        "openai",
++}
++
++// lcodeFormat is the API format magpie's provider has in LCode's files in
++// dir: the one the user picked in LCode's settings, else Anthropic Messages.
++// magpie writes both files together, so where they differ the user changed
++// one of them in LCode (provider_config.json from 3.14 on, config.json
++// before): the one written last has their choice, which is carried to the
++// other.
++func lcodeFormat(dir string) string {
++	rules, kind := lcodeRuleFormat(dir), ""
++	path := filepath.Join(dir, "config.json")
++	if k, _ := edit.GetJSON(path, "provider."+magpieID+".kind"); k != "" {
++		for f, fk := range lcodeKinds {
++			if fk == k {
++				kind = f
++			}
++		}
++	}
++	switch {
++	case kind == "" && rules == "":
++		return "anthropic-messages"
++	case kind == "":
++		return rules
++	case rules == "" || rules == kind:
++		return kind
++	}
++	a, errA := os.Stat(filepath.Join(dir, "provider_config.json"))
++	b, errB := os.Stat(path)
++	if errA == nil && errB == nil && b.ModTime().After(a.ModTime()) {
++		return kind
++	}
++	return rules
++}
++
++// lcodeRuleFormat is magpie's provider's API format in provider_config.json
++// in dir, or "" when it has none LCode knows.
++func lcodeRuleFormat(dir string) string {
++	var r struct {
++		Config struct {
++			ProviderConfigRules struct {
++				ProviderRules []struct {
++					ProviderID string `json:"providerId"`
++					Config     struct {
++						API struct {
++							Type string `json:"type"`
++						} `json:"api"`
++					} `json:"config"`
++				} `json:"providerRules"`
++			} `json:"providerConfigRules"`
++		} `json:"config"`
++	}
++	b, _ := os.ReadFile(filepath.Join(dir, "provider_config.json"))
++	json.Unmarshal(b, &r)
++	for _, p := range r.Config.ProviderConfigRules.ProviderRules {
++		if _, ok := lcodeKinds[p.Config.API.Type]; ok && p.ProviderID == magpieID {
++			return p.Config.API.Type
++		}
++	}
++	return ""
++}
++
++// lcodeMaxOutput caps a model's output limit: some vendors report their
++// context window there (grok's 500000), and LCode would offer that much.
++const lcodeMaxOutput = 128000
++
++func lcodeOutput(n int) int { return min(n, lcodeMaxOutput) }
++
++// lcodeLevels are a model's reasoning levels as LCode names them: "disabled"
++// turns thinking off, any other is sent as the effort.
++func lcodeLevels(efforts []string) []string {
++	var out []string
++	for _, e := range efforts {
++		if e == "none" {
++			e = "disabled"
++		}
++		if !slices.Contains(out, e) {
++			out = append(out, e)
++		}
++	}
++	return out
++}
++
++// lcodeDefaultLevel is medium where the model has it, else its middle level
++// that thinks.
++func lcodeDefaultLevel(levels []string) string {
++	if slices.Contains(levels, "medium") {
++		return "medium"
++	}
++	on := slices.DeleteFunc(slices.Clone(levels), func(l string) bool { return l == "disabled" })
++	if len(on) == 0 {
++		return levels[0]
++	}
++	return on[len(on)/2]
++}
++
++// lcodeRuled reports whether provider_config.json has magpie's provider.
++func lcodeRuled(path string) bool {
++	var c struct {
++		Config struct {
++			ProviderConfigRules struct {
++				ProviderRules []struct {
++					ProviderID string `json:"providerId"`
++				} `json:"providerRules"`
++			} `json:"providerConfigRules"`
++		} `json:"config"`
++	}
++	b, _ := os.ReadFile(path)
++	if json.Unmarshal(b, &c) != nil {
++		return false
++	}
++	for _, r := range c.Config.ProviderConfigRules.ProviderRules {
++		if r.ProviderID == magpieID {
++			return true
++		}
++	}
++	return false
++}
++
++// lcodeRules puts magpie's provider and its models' rules into LCode's
++// provider_config.json (on) or takes them out, leaving every other rule and
++// key as LCode wrote it. A sync (keep) leaves an address on another machine
++// as it found it (lcodeAddress).
++func lcodeRules(path string, on, keep bool) error {
++	b, err := edit.Read(path)
++	if err != nil {
++		return err
++	}
++	if b == nil && !on {
++		return nil
++	}
++	doc := map[string]any{}
++	if len(b) > 0 {
++		if err := json.Unmarshal(b, &doc); err != nil {
++			return err
++		}
++	}
++	if doc["schemaVersion"] == nil {
++		doc["schemaVersion"] = 1
++	}
++	cfg := lcodeObj(doc, "config")
++	pcr := lcodeObj(cfg, "providerConfigRules")
++	mcr := lcodeObj(cfg, "modelConfigRules")
++	mine := func(r any) bool { m, _ := r.(map[string]any); return m != nil && m["providerId"] == magpieID }
++
++	var old map[string]any
++	var providers []any
++	at := -1 // where magpie's was, which it keeps
++	for _, r := range lcodeList(pcr, "providerRules") {
++		if mine(r) {
++			old, _ = r.(map[string]any)
++			at = len(providers)
++			continue
++		}
++		providers = append(providers, r)
++	}
++	var models, manual []any
++	byHand := map[any]bool{}
++	for _, r := range lcodeList(mcr, "manualProviderModelRules") {
++		if mine(r) {
++			if !on {
++				continue
++			}
++			byHand[r.(map[string]any)["modelId"]] = true
++		}
++		manual = append(manual, r)
++	}
++	// magpie's model rules as they are now, which LCode's own settings
++	// write a model's edits into while it keeps its recommended config
++	ours := map[any]map[string]any{}
++	for _, r := range lcodeList(mcr, "providerModelRules") {
++		if !mine(r) {
++			models = append(models, r)
++			continue
++		}
++		m := r.(map[string]any)
++		ours[m["modelId"]] = m
++	}
++
++	if on {
++		format := lcodeFormat(filepath.Dir(path))
++		searched, known := lcodeSearched()
++		var ids []string
++		for _, m := range magpieModels("lcode") {
++			ids = append(ids, m.ID)
++			if byHand[m.ID] {
++				// set by hand in LCode: its own settings, and the default
++				// again should it go back to its recommended config
++				delete(searched, m.ID)
++				continue
++			}
++			props := map[string]any{"inputFormat": map[string]any{"supportsImage": m.Images}}
++			if m.Context > 0 {
++				props["contextWindow"] = m.Context
++			}
++			if v, set := lcodeWebSearch(ours[m.ID], m.ID, format == "anthropic-messages" && known, searched); set {
++				props["supportsNativeWebSearch"] = v
++			}
++			config := map[string]any{"properties": props}
++			// LCode's own rules give a model it doesn't know 32000 tokens
++			// out and thinking only on or off
++			specs := map[string]any{}
++			if out := outputOr(m, lcodeOutput(maxTokens(m))); out > 0 {
++				specs["maxOutputTokens"] = map[string]any{"max": out}
++			}
++			if levels := lcodeLevels(m.Efforts); levels != nil {
++				specs["reasoningLevel"] = map[string]any{"values": levels}
++			}
++			if len(specs) > 0 {
++				config["optionSpecs"] = specs
++			}
++			models = append(models, map[string]any{"providerId": magpieID, "modelId": m.ID, "config": config})
++		}
++		if ids == nil {
++			ids = []string{}
++		}
++		if known {
++			lcodeSearchedPut(searched, ids)
++		}
++		base, token := gateway.URL(), hereKey()
++		if keep {
++			base, token = lcodeKept(filepath.Dir(path))
++		}
++		rule := map[string]any{"providerId": magpieID, "providerName": "magpie", "enabled": true,
++			"config": map[string]any{
++				"group":            "standard-personal",
++				"access":           map[string]any{"type": "api-key", "apiKey": token},
++				"api":              map[string]any{"type": format, "baseUrl": base},
++				"personalModelIds": ids, "modelOrder": ids,
++			}}
++		// turned off in LCode, it stays off
++		if e, ok := old["enabled"].(bool); ok {
++			rule["enabled"] = e
++		}
++		// What the user set on it in LCode stays (#2030): its name, logo,
++		// visibility, a header or the key's management link
++		// (packages/provider/src/config/provider-data-schema.ts). LCode
++		// checks the file strictly, so only keys it already took are kept;
++		// the address, key, format and model lists are magpie's.
++		if old != nil {
++			if name, _ := old["providerName"].(string); strings.TrimSpace(name) != "" {
++				rule["providerName"] = name
++			}
++			if oc, _ := old["config"].(map[string]any); oc != nil {
++				rule["config"] = mergeKept(oc, rule["config"].(map[string]any), []string{"group", "personalModelIds", "modelOrder"})
++			}
++			rule = mergeKept(old, rule, nil)
++		}
++		if at >= 0 {
++			providers = slices.Insert(providers, at, any(rule))
++		} else {
++			providers = append(providers, rule)
++		}
++	}
++	pcr["providerRules"] = lcodeNonNil(providers)
++	mcr["providerModelRules"] = lcodeNonNil(models)
++	mcr["manualProviderModelRules"] = lcodeNonNil(manual)
++
++	out, err := json.Marshal(doc)
++	if err != nil {
++		return err
++	}
++	if string(out) == string(b) {
++		return nil
++	}
++	if b == nil {
++		// LCode keeps it private
++		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++			return err
++		}
++		if err := os.WriteFile(path, nil, 0o600); err != nil {
++			return err
++		}
++	}
++	return edit.WriteAtomic(path, out)
++}
++
++// LCode offers a model its WebSearch tool only where the model's rule says
++// it has native web search (properties.supportsNativeWebSearch, 原生联网搜索
++// in a model's settings), off by default. Its tool then asks the model
++// again with Anthropic's web_search tool, which only an Anthropic Messages
++// provider is sent: on another API format LCode fails the search. magpie's
++// gateway runs that tool for any of its models, so it turns native web
++// search on for each model it lists while the format is Anthropic Messages
++// (Gearclickist on Discord: every magpie model had to be ticked by hand).
++//
++// LCode writes a change to a model with its recommended config into the
++// model's rule, magpie's, and leaves a value equal to LCode's default out of
++// it: unticking native web search takes the key out. So the models magpie
++// turned it on for are kept in the stash (lcodeSearchedKey), and one of
++// them whose rule has no key now was unticked in LCode and stays off. A
++// value in the rule is kept as it is.
++const lcodeSearchedKey = "lcode.web_search"
++
++// lcodeWebSearch is what magpie's rule for model id, which says old now,
++// says of native web search: v, or nothing when set is false. anthropic is
++// whether LCode sends the model's provider-native search (the provider's
++// format is Anthropic Messages, and the stash could be read). searched holds
++// the models magpie turned it on for and is updated.
++func lcodeWebSearch(old map[string]any, id string, anthropic bool, searched map[string]bool) (v, set bool) {
++	props, _ := old["config"].(map[string]any)
++	props, _ = props["properties"].(map[string]any)
++	was, had := props["supportsNativeWebSearch"].(bool)
++	switch {
++	case !anthropic:
++		// magpie's on can't be used there; the user's own value stays
++		if had && was && searched[id] {
++			delete(searched, id)
++			return false, false
++		}
++		return was, had
++	case had:
++		if was {
++			searched[id] = true
++		}
++		return was, true
++	case searched[id]:
++		// unticked in LCode
++		return false, false
++	}
++	searched[id] = true
++	return true, true
++}
++
++// lcodeSearched is the models magpie turned LCode's native web search on
++// for, and whether the stash could be read: a stash there that can't be
++// read or parsed is unknown, and nothing is turned on.
++func lcodeSearched() (map[string]bool, bool) {
++	out := map[string]bool{}
++	b, err := os.ReadFile(stashPath())
++	if errors.Is(err, fs.ErrNotExist) {
++		return out, true
++	}
++	var m map[string]string
++	if err != nil || json.Unmarshal(b, &m) != nil {
++		return out, false
++	}
++	if v := m[lcodeSearchedKey]; v != "" {
++		for _, id := range strings.Split(v, "\n") {
++			out[id] = true
++		}
++	}
++	return out, true
++}
++
++// lcodeSearchedPut keeps searched in the stash, only for models magpie
++// still lists (ids), and writes it only when that changes it.
++func lcodeSearchedPut(searched map[string]bool, ids []string) {
++	var keep []string
++	for _, id := range ids {
++		if searched[id] {
++			keep = append(keep, id)
++		}
++	}
++	v := strings.Join(keep, "\n")
++	if stashLoad()[lcodeSearchedKey] != v {
++		stash(map[string]string{lcodeSearchedKey: v})
++	}
++}
++
++func lcodeObj(m map[string]any, k string) map[string]any {
++	o, ok := m[k].(map[string]any)
++	if !ok {
++		o = map[string]any{}
++		m[k] = o
++	}
++	return o
++}
++
++func lcodeList(m map[string]any, k string) []any { l, _ := m[k].([]any); return l }
++
++func lcodeNonNil(l []any) []any {
++	if l == nil {
++		return []any{}
++	}
++	return l
++}
++
++// what lcode says after a change (notice.go)
++var (
++	noticeLcode = newNotice("LCode reads its providers at start-up — restart LCode to see magpie's models in its picker.")
++)
+diff --git a/internal/appdir/lcode.go b/internal/appdir/lcode.go
+new file mode 100644
+index 0000000..7b94949
+--- /dev/null
++++ b/internal/appdir/lcode.go
+@@ -0,0 +1,34 @@
++package appdir
++
++import (
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++)
++
++// LCodeHome is the home folder LCode (a ZCode fork, also a Node/Electron
++// app) reads, given home, the user's home as Go reads it (os.UserHomeDir).
++// Like ZCode it takes $HOME before os.homedir() on every OS: its data
++// folder (getDataBaseDir), settings (resolveUserHomeDir) and the skills it
++// reads. On a Mac or Linux that is Go's home too. On Windows Go's is
++// USERPROFILE and HOME is mostly unset, but one the user set (for Git
++// Bash, MSYS2 or Emacs) is where LCode keeps everything, and magpie would
++// otherwise write its provider under USERPROFILE, where LCode never looks
++// (the same trap ZCodeHome exists for).
++func LCodeHome(home string) string { return LCodeHomeOn(runtime.GOOS, home) }
++
++// LCodeHomeOn is LCodeHome on goos, so a test can ask for Windows'. A HOME
++// that isn't rooted is left out. Only the user's own home is moved: a
++// folder that isn't USERPROFILE (a test's, a WSL distro's) is LCode's as
++// given.
++func LCodeHomeOn(goos, home string) string {
++	if goos != "windows" {
++		return home
++	}
++	h := strings.TrimSpace(os.Getenv("HOME"))
++	if h == "" || !rooted(h) || !strings.EqualFold(filepath.Clean(home), filepath.Clean(os.Getenv("USERPROFILE"))) {
++		return home
++	}
++	return h
++}
+diff --git a/internal/gui/assets/app.js b/internal/gui/assets/app.js
+index 0eb1c2e..d3fe9d8 100644
+--- a/internal/gui/assets/app.js
++++ b/internal/gui/assets/app.js
+@@ -293,7 +293,7 @@ function maskSpan(src, failed) {
+   if (failed) load.then((ok) => ok || failed());
+   return m;
+ }
+-const pngIcons = new Set(["crush", "zcode", "alma", "hanako", "cindy", "lody", "typesafe", "atomcode", "snow", "mlx-serve", "mothx", "zoo-code"]);
++const pngIcons = new Set(["crush", "zcode", "lcode", "alma", "hanako", "cindy", "lody", "typesafe", "atomcode", "snow", "mlx-serve", "mothx", "zoo-code"]);
+ 
+ function icon(name) {
+   const kept = keptIcons?.get(name || "")?.shift();
+diff --git a/internal/gui/assets/i18n.js b/internal/gui/assets/i18n.js
+index 3c6c34f..b15fe52 100644
+--- a/internal/gui/assets/i18n.js
++++ b/internal/gui/assets/i18n.js
+@@ -3798,6 +3798,7 @@ const I18N = {
+     "WSL {distro} is in {net} networking, not mirrored, so its {agent} was pointed at Windows ({url}) rather than 127.0.0.1; magpie listens there for WSL, and it answers once Windows' firewall lets WSL in. For 127.0.0.1, set networkingMode=mirrored under [wsl2] in %UserProfile%\\.wslconfig and run wsl --shutdown, then pick the model again.": "WSL {distro} 使用 {net} 网络模式而不是 mirrored，因此其中的 {agent} 指向 Windows（{url}）而不是 127.0.0.1；magpie 会在该地址为 WSL 监听，Windows 防火墙放行 WSL 后即可连通。若要使用 127.0.0.1，请在 %UserProfile%\\.wslconfig 的 [wsl2] 下设置 networkingMode=mirrored 并运行 wsl --shutdown，然后重新选择模型。",
+     "WSL {distro} isn't running: magpie shows what it last saw there, and starts it only to change something.": "WSL {distro} 未运行：magpie 显示的是上次看到的内容，只在需要修改时才启动它。",
+     "ZCode reads its providers at start-up — restart ZCode to see magpie's models in its picker.": "ZCode 启动时读取供应商，需重启 ZCode 才能在它的模型选择器中看到 magpie 的模型。",
++    "LCode reads its providers at start-up — restart LCode to see magpie's models in its picker.": "LCode 启动时读取供应商，需重启 LCode 才能在它的模型选择器中看到 magpie 的模型。",
+     "AstrBot reads cmd_config.json at start-up and writes it back whole when its WebUI saves settings — restart AstrBot to use this, before saving anything in its WebUI.": "AstrBot 启动时读取 cmd_config.json，并在其 WebUI 保存设置时整份写回——请重启 AstrBot 以使用此设置，且在此之前不要在其 WebUI 中保存任何内容。",
+     "agy takes magpie's gateway and model only from how it is started — start it with {command}": "agy 只从启动方式中获取 magpie 的网关和模型，请这样启动它：{command}",
+     "dsh reads its config at start-up — restart open dsh sessions to use this.": "dsh 启动时读取配置，需重启已打开的 dsh 会话才会生效。",
+@@ -7757,6 +7758,7 @@ const I18N = {
+     "WSL {distro} is in {net} networking, not mirrored, so its {agent} was pointed at Windows ({url}) rather than 127.0.0.1; magpie listens there for WSL, and it answers once Windows' firewall lets WSL in. For 127.0.0.1, set networkingMode=mirrored under [wsl2] in %UserProfile%\\.wslconfig and run wsl --shutdown, then pick the model again.": "WSL {distro} 使用 {net} 網路模式而不是 mirrored，因此其中的 {agent} 指向 Windows（{url}）而不是 127.0.0.1；magpie 會在該位址為 WSL 監聽，Windows 防火牆放行 WSL 後即可連通。若要使用 127.0.0.1，請在 %UserProfile%\\.wslconfig 的 [wsl2] 下設定 networkingMode=mirrored 並執行 wsl --shutdown，然後重新選擇模型。",
+     "WSL {distro} isn't running: magpie shows what it last saw there, and starts it only to change something.": "WSL {distro} 未執行：magpie 顯示的是上次看到的內容，只在需要修改時才啟動它。",
+     "ZCode reads its providers at start-up — restart ZCode to see magpie's models in its picker.": "ZCode 啟動時讀取供應商，需重啟 ZCode 才能在它的模型選擇器中看到 magpie 的模型。",
++    "LCode reads its providers at start-up — restart LCode to see magpie's models in its picker.": "LCode 啟動時讀取供應商，需重啟 LCode 才能在它的模型選擇器中看到 magpie 的模型。",
+     "AstrBot reads cmd_config.json at start-up and writes it back whole when its WebUI saves settings — restart AstrBot to use this, before saving anything in its WebUI.": "AstrBot 啟動時讀取 cmd_config.json，並在其 WebUI 儲存設定時整份寫回——請重啟 AstrBot 以使用此設定，且在此之前不要在其 WebUI 中儲存任何內容。",
+     "agy takes magpie's gateway and model only from how it is started — start it with {command}": "agy 只從啟動方式中取得 magpie 的閘道和模型，請這樣啟動它：{command}",
+     "dsh reads its config at start-up — restart open dsh sessions to use this.": "dsh 啟動時讀取設定，需重啟已打開的 dsh 會話才會生效。",
+@@ -11718,6 +11720,7 @@ const I18N = {
+     "WSL {distro} is in {net} networking, not mirrored, so its {agent} was pointed at Windows ({url}) rather than 127.0.0.1; magpie listens there for WSL, and it answers once Windows' firewall lets WSL in. For 127.0.0.1, set networkingMode=mirrored under [wsl2] in %UserProfile%\\.wslconfig and run wsl --shutdown, then pick the model again.": "WSL {distro} は mirrored ではなく {net} ネットワークのため、{agent} の接続先は 127.0.0.1 ではなく Windows（{url}）にしました。magpie はそこで WSL 向けに待ち受けており、Windows のファイアウォールが WSL を通せば応答します。127.0.0.1 にするには %UserProfile%\\.wslconfig の [wsl2] に networkingMode=mirrored を設定して wsl --shutdown を実行し、モデルを選び直してください。",
+     "WSL {distro} isn't running: magpie shows what it last saw there, and starts it only to change something.": "WSL {distro} は起動していません。magpie は最後に見た内容を表示し、変更するときだけ起動します。",
+     "ZCode reads its providers at start-up — restart ZCode to see magpie's models in its picker.": "ZCode は起動時にプロバイダを読み込みます。モデル選択に magpie のモデルを表示するには ZCode を再起動してください。",
++    "LCode reads its providers at start-up — restart LCode to see magpie's models in its picker.": "LCode は起動時にプロバイダを読み込みます。モデル選択に magpie のモデルを表示するには LCode を再起動してください。",
+     "AstrBot reads cmd_config.json at start-up and writes it back whole when its WebUI saves settings — restart AstrBot to use this, before saving anything in its WebUI.": "AstrBot は起動時に cmd_config.json を読み込み、WebUI で設定を保存するとファイル全体を書き戻します。これを使うには、WebUI で何かを保存する前に AstrBot を再起動してください。",
+     "agy takes magpie's gateway and model only from how it is started — start it with {command}": "agy は magpie のゲートウェイとモデルを起動方法からしか受け取りません。次のように起動してください：{command}",
+     "dsh reads its config at start-up — restart open dsh sessions to use this.": "dsh は起動時に設定を読み込みます。反映するには開いている dsh セッションを再起動してください。",
+@@ -15679,6 +15682,7 @@ const I18N = {
+     "WSL {distro} is in {net} networking, not mirrored, so its {agent} was pointed at Windows ({url}) rather than 127.0.0.1; magpie listens there for WSL, and it answers once Windows' firewall lets WSL in. For 127.0.0.1, set networkingMode=mirrored under [wsl2] in %UserProfile%\\.wslconfig and run wsl --shutdown, then pick the model again.": "WSL {distro} nutzt {net}-Netzwerk, nicht mirrored, daher zeigt sein {agent} auf Windows ({url}) statt auf 127.0.0.1; dort lauscht magpie für WSL, und es antwortet, sobald die Windows-Firewall WSL durchlässt. Für 127.0.0.1 networkingMode=mirrored unter [wsl2] in %UserProfile%\\.wslconfig setzen, wsl --shutdown ausführen und das Modell erneut wählen.",
+     "WSL {distro} isn't running: magpie shows what it last saw there, and starts it only to change something.": "WSL {distro} läuft nicht: magpie zeigt, was es dort zuletzt gesehen hat, und startet es nur, um etwas zu ändern.",
+     "ZCode reads its providers at start-up — restart ZCode to see magpie's models in its picker.": "ZCode liest seine Anbieter beim Start – ZCode neu starten, um magpies Modelle in seiner Auswahl zu sehen.",
++    "LCode reads its providers at start-up — restart LCode to see magpie's models in its picker.": "LCode liest seine Anbieter beim Start – LCode neu starten, um magpies Modelle in seiner Auswahl zu sehen.",
+     "AstrBot reads cmd_config.json at start-up and writes it back whole when its WebUI saves settings — restart AstrBot to use this, before saving anything in its WebUI.": "AstrBot liest cmd_config.json beim Start und schreibt sie ganz zurück, wenn seine WebUI Einstellungen speichert – AstrBot neu starten, um dies zu nutzen, bevor in seiner WebUI etwas gespeichert wird.",
+     "agy takes magpie's gateway and model only from how it is started — start it with {command}": "agy übernimmt magpies Gateway und Modell nur aus seinem Startbefehl – so starten: {command}",
+     "dsh reads its config at start-up — restart open dsh sessions to use this.": "dsh liest seine Konfiguration beim Start – offene dsh-Sitzungen neu starten, damit es gilt.",
+@@ -15915,6 +15919,7 @@ const NOTICES = [
+   "WSL {distro} is in {net} networking, not mirrored, so its {agent} was pointed at Windows ({url}) rather than 127.0.0.1; magpie listens there for WSL, and it answers once Windows' firewall lets WSL in. For 127.0.0.1, set networkingMode=mirrored under [wsl2] in %UserProfile%\\.wslconfig and run wsl --shutdown, then pick the model again.",
+   "WSL {distro} isn't running: magpie shows what it last saw there, and starts it only to change something.",
+   "ZCode reads its providers at start-up — restart ZCode to see magpie's models in its picker.",
++  "LCode reads its providers at start-up — restart LCode to see magpie's models in its picker.",
+   "agy takes magpie's gateway and model only from how it is started — start it with {command}",
+   "an open Claude Code session keeps the effort it started with — restart it to use this.",
+   "an open Claude Code session keeps the ultracode it started with — restart it to use this.",
+diff --git a/internal/gui/assets/icons/lcode.png b/internal/gui/assets/icons/lcode.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..766a3fec68d2fa3673c18d84d2f4fbafe0887355
+GIT binary patch
+literal 9394
+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
+
+literal 0
+HcmV?d00001
+
