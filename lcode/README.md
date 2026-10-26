@@ -78,6 +78,29 @@ A internal/gui/assets/icons/lcode.png 新增     图标，取自 LCode.app 的 i
 
 补丁冲突时会打印冲突文件并停下，不会产生半个构建。处理办法见下方。
 
+### Windows 更新
+
+Windows 上对应的是 `update-windows.sh`（在 Git Bash 里跑）：
+
+```bash
+./update-windows.sh              # 检查更新，有就构建、放到桌面并启动
+./update-windows.sh --check      # 只看版本，不动手
+./update-windows.sh --force      # 已是最新也强制重建
+./update-windows.sh --no-launch  # 构建并放到桌面，但不启动
+./update-windows.sh --arch arm64 # 默认 amd64
+./update-windows.sh --go /path/to/go.exe   # 本机有 Go 就用本机的
+```
+
+和 `update.sh` 一样：查官方最新 → 增量 fetch → worktree 打补丁 → 编译。
+不同的只有收尾两处：
+
+- 打包换成 Windows 的 `go-winres`（把 `build/windows/` 里的图标
+  和版本打进 exe），链接成 `-H windowsgui` 的 GUI 程序，双击不弹控制台；
+- 产物不装进 `/Applications`，直接放到桌面为 `magpie.exe`，覆盖前停掉旧进程。
+
+本机没有 Go 时会自动下一份便携版到 `~/.cache/magpie-lcode`，不进 PATH、不改注册表；
+下载中断重跑会接着断点下。
+
 ## 从零重建
 
 `apply-lcode.sh` 用于全新环境或需要重来时（会重新克隆约 200MB）：
