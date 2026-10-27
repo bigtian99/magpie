@@ -5,7 +5,7 @@
 
 - 补丁：`patches/0001-add-lcode-agent.patch`
 - 一键脚本：`apply-lcode.sh`
-- 基线版本：**官方 release v0.1.1664**（commit `d5f86d99`）
+- 基线版本：**官方 release v0.1.1666**（commit `f3c4d7b7`）
 
 ## 为什么能这么做
 

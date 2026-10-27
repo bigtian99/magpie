@@ -40,11 +40,26 @@ cd "$SRC"
 # ---- 1. 查官方最新版本 ----
 if [ -z "$TAG" ]; then
   echo "==> 查询官方最新 release"
-  TAG="$(curl -fsSL --max-time 25 \
-        https://api.github.com/repos/yetone/magpie-releases/releases/latest \
-        | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  # 网络会抖：超时就重试，别让一次 curl 失败毁掉整次更新
+  for attempt in 1 2 3; do
+    TAG="$(curl -fsSL --max-time 25 \
+          https://api.github.com/repos/yetone/magpie-releases/releases/latest \
+          | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    [ -n "$TAG" ] && break
+    if [ "$attempt" -lt 3 ]; then
+      echo "    第 $attempt 次查询失败，3 秒后重试"
+      sleep 3
+    fi
+  done
 fi
-[ -n "$TAG" ] || { echo "查不到官方版本，请用 --tag 指定" >&2; exit 1; }
+if [ -z "$TAG" ]; then
+  echo "" >&2
+  echo "查不到官方版本（网络不通）。可以：" >&2
+  echo "  1. 重试一次" >&2
+  echo "  2. 用已有版本构建: ./update.sh --tag v0.1.1664" >&2
+  echo "  3. 已装的是最新的话不用管" >&2
+  exit 1
+fi
 
 INSTALLED="$("$APP/Contents/MacOS/magpie" version 2>/dev/null | awk '{print $2}' || echo "未安装")"
 echo "    官方最新: $TAG"
@@ -104,7 +119,7 @@ if ! git apply --check "$SCRIPT_DIR/patches/0001-add-lcode-agent.patch" 2>/dev/n
 else
   git apply "$SCRIPT_DIR/patches/0001-add-lcode-agent.patch"
 fi
-echo "✓ 补丁已应用（基于 $TAG / $BASE）"
+echo "✓ 补丁已应用（基于 ${TAG} / ${BASE}）"
 
 # ---- 4. 编译 ----
 # -buildvcs=false：上层目录若有 svn 等其它 VCS，Go 会报 "multiple VCS detected"
@@ -140,7 +155,7 @@ if [ "$DO_INSTALL" = 1 ]; then
   if [ "$NEW" = "${TAG#v}" ]; then
     echo "✓ 已安装并启动: magpie $NEW"
   else
-    echo "!! 安装后版本不对: $NEW（期望 ${TAG#v}）" >&2
+    echo "!! 安装后版本不对: ${NEW}（期望 ${TAG#v}）" >&2
     exit 1
   fi
   if curl -fsS --max-time 5 http://127.0.0.1:3425/api/hello >/dev/null 2>&1; then
@@ -189,4 +204,4 @@ PY
 fi
 
 echo ""
-echo "完成：magpie ${TAG#v}（官方 $TAG / $BASE）"
+echo "完成：magpie ${TAG#v}（官方 ${TAG} / ${BASE}）"
