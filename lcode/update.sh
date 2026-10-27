@@ -79,18 +79,43 @@ fi
 echo "==> 拉取 $TAG"
 have_tag() { git cat-file -e "$TAG^{tree}" 2>/dev/null; }
 
+# 拉取会失败在网络，也会失败在深度不够，两者分开重试：
+# 之前所有 fetch 都 2>/dev/null，网络一抖就报成"拿不到文件树"，看不出真因。
+FETCH_ERR=""
+try_fetch() {
+  local out
+  if out=$(git fetch "$@" 2>&1); then
+    FETCH_ERR=""
+    return 0
+  fi
+  FETCH_ERR="$(printf '%s' "$out" | tail -2)"
+  return 1
+}
+
 if ! have_tag; then
   for depth in 100 300 800 2000; do
-    git fetch --depth "$depth" https://github.com/yetone/magpie.git "tag" "$TAG" 2>/dev/null || true
+    try_fetch --depth "$depth" https://github.com/yetone/magpie.git "tag" "$TAG" || true
     have_tag && break
   done
 fi
 # 还不行就只取这一个提交的树（不带历史），浅克隆也能成
 if ! have_tag; then
   echo "    深度拉取不够，改为只取该提交"
-  git fetch --depth 1 https://github.com/yetone/magpie.git "+refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
+  for attempt in 1 2 3; do
+    try_fetch --depth 1 https://github.com/yetone/magpie.git "+refs/tags/$TAG:refs/tags/$TAG" || true
+    have_tag && break
+    [ "$attempt" -lt 3 ] && { echo "    第 $attempt 次失败，5 秒后重试"; sleep 5; }
+  done
 fi
-have_tag || { echo "拉取 $TAG 失败（拿不到它的文件树）" >&2; exit 1; }
+if ! have_tag; then
+  echo "" >&2
+  echo "拉取 $TAG 失败。" >&2
+  [ -n "$FETCH_ERR" ] && echo "最后一次 git 说：$FETCH_ERR" >&2
+  echo "" >&2
+  echo "多半是网络问题，重跑一次通常就好。也可以：" >&2
+  echo "  ./update.sh --tag v0.1.1666     # 用本地已有的版本" >&2
+  exit 1
+fi
 BASE="$(git rev-parse --short "$TAG")"
 
 # ---- 3. 在独立 worktree 里打补丁，不碰你本地分支 ----
