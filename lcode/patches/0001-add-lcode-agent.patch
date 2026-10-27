@@ -709,10 +709,10 @@ index a339ee5c..3da343be 100644
  		// first (rpm.go); the ChatGPT backend is spoken to over HTTP/1.1
 diff --git a/internal/gateway/rests.go b/internal/gateway/rests.go
 new file mode 100644
-index 00000000..5b0b9825
+index 00000000..9eac40e6
 --- /dev/null
 +++ b/internal/gateway/rests.go
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,167 @@
 +package gateway
 +
 +import (
@@ -801,7 +801,9 @@ index 00000000..5b0b9825
 +func restsWhere(dir string) {
 +	restsMu.Lock()
 +	restsPath = filepath.Join(dir, restsFile)
++	path := restsPath
 +	restsMu.Unlock()
++	_ = path
 +	restsLoad()
 +}
 +
