@@ -86,7 +86,9 @@ func restsFlush() {
 func restsWhere(dir string) {
 	restsMu.Lock()
 	restsPath = filepath.Join(dir, restsFile)
+	path := restsPath
 	restsMu.Unlock()
+	_ = path
 	restsLoad()
 }
 
