@@ -40,6 +40,19 @@ done
 
 cd "$SRC"
 
+# ---- 0. 从当前分支重新生成补丁 ----
+# 改了 adapter（internal/ 下的文件）之后补丁要跟着重做，否则下次 update
+# 装的还是旧代码。基线取当前分支最近的 tag。
+if [ "$REPATCH" = 1 ]; then
+  BASE_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+  [ -n "$BASE_TAG" ] || { echo "取不到基线 tag：分支应先基于某个官方 tag" >&2; exit 1; }
+  echo "==> 从分支重新生成补丁（基线 $BASE_TAG）"
+  git diff "$BASE_TAG..HEAD" --binary -- internal/ > "$SCRIPT_DIR/patches/0001-add-lcode-agent.patch"
+  echo "✓ 补丁已重做: $(wc -l < "$SCRIPT_DIR/patches/0001-add-lcode-agent.patch" | tr -d ' ') 行"
+  git diff "$BASE_TAG..HEAD" --stat -- internal/ | tail -10
+  exit 0
+fi
+
 # ---- 1. 查官方最新版本 ----
 if [ -z "$TAG" ]; then
   echo "==> 查询官方最新 release"
