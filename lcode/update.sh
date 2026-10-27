@@ -10,6 +10,7 @@
 #   ./update.sh --force       # 已是最新版也强制重建
 #   ./update.sh --no-install  # 构建但不安装
 #   ./update.sh --tag v0.1.1585  # 指定版本
+#   ./update.sh --repatch        # 从当前分支重新生成补丁（改了 adapter 之后用）
 
 set -euo pipefail
 
@@ -21,6 +22,7 @@ APP="/Applications/magpie.app"
 CHECK_ONLY=0
 FORCE=0
 DO_INSTALL=1
+REPATCH=0
 TAG=""
 
 while [ $# -gt 0 ]; do
@@ -29,6 +31,7 @@ while [ $# -gt 0 ]; do
     --force)      FORCE=1 ;;
     --no-install) DO_INSTALL=0 ;;
     --tag)        shift; TAG="${1:-}" ;;
+    --repatch)    REPATCH=1 ;;
     -h|--help)    awk 'NR>1 && /^#/ {sub(/^# ?/,""); print} NR>1 && !/^#/ {exit}' "$0"; exit 0 ;;
     *) echo "未知参数: $1（-h 看用法）" >&2; exit 1 ;;
   esac

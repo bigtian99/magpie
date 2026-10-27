@@ -928,6 +928,7 @@ func restDrawer(c candidate, code int, msg string) {
 	restingUntil.Lock()
 	restingUntil.m[r.Key] = r.Until
 	restingUntil.note[r.Key] = r
+	restsChanged()
 	restingUntil.Unlock()
 }
 

@@ -610,6 +610,7 @@ func narrowWhenRead(c candidate, r Rest) {
 		restingUntil.m[rid] = r.Until
 		restingUntil.note[rid] = r
 	}
+	restsChanged()
 }
 
 // keyAllowance and staleKeyAllowance are provider.KeyAllowance and
@@ -633,6 +634,7 @@ func (s *Server) Unrest(key string) bool {
 	_, ok := restingUntil.m[key]
 	delete(restingUntil.m, key)
 	delete(restingUntil.note, key)
+	restsChanged()
 	liftedLocked(key, time.Now())
 	restingUntil.Unlock()
 	unsink(key)
@@ -1217,6 +1219,7 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 	}
 	restingUntil.m[id] = r.Until
 	restingUntil.note[id] = r
+	restsChanged()
 	restingUntil.Unlock()
 	if unread && id == c.restKey() && id != c.restID() {
 		narrowing.Add(1)
