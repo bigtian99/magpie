@@ -58,16 +58,24 @@ fi
 [ "$CHECK_ONLY" = 1 ] && { echo "==> 有更新（--check 只查不动）"; exit 0; }
 
 # ---- 2. 拉取该 tag ----
+# 校验用 ^{tree} 而不是 rev-parse "$TAG"：浅克隆里 tag 的 commit 对象可能到了，
+# 但它 parent 的历史没到，rev-parse "$TAG" 会成功而 ^{commit} 会报
+# "Needed a single revision"。构建只需要这个提交的树，tree 在就够。
 echo "==> 拉取 $TAG"
-if ! git rev-parse "$TAG" >/dev/null 2>&1; then
-  # 浅克隆要够深才能拿到 tag 的历史，逐级加深
-  for depth in 100 300 800; do
-    if git fetch --depth "$depth" https://github.com/yetone/magpie.git "tag" "$TAG" 2>/dev/null; then
-      break
-    fi
+have_tag() { git cat-file -e "$TAG^{tree}" 2>/dev/null; }
+
+if ! have_tag; then
+  for depth in 100 300 800 2000; do
+    git fetch --depth "$depth" https://github.com/yetone/magpie.git "tag" "$TAG" 2>/dev/null || true
+    have_tag && break
   done
 fi
-git rev-parse "$TAG" >/dev/null 2>&1 || { echo "拉取 $TAG 失败" >&2; exit 1; }
+# 还不行就只取这一个提交的树（不带历史），浅克隆也能成
+if ! have_tag; then
+  echo "    深度拉取不够，改为只取该提交"
+  git fetch --depth 1 https://github.com/yetone/magpie.git "+refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
+fi
+have_tag || { echo "拉取 $TAG 失败（拿不到它的文件树）" >&2; exit 1; }
 BASE="$(git rev-parse --short "$TAG")"
 
 # ---- 3. 在独立 worktree 里打补丁，不碰你本地分支 ----
